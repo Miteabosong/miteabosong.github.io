@@ -115,6 +115,9 @@
   .steps .st.done{background:var(--ok);color:#fff}
   .steps .st.now{background:var(--accent);color:#fff;animation:tw 1.4s ease-in-out infinite}
   .steps .bar{flex:1;height:4px;border-radius:4px;background:#efe2d2;overflow:hidden;position:relative}
+  .steps .bar b.full{position:absolute;inset:0;background:var(--ok)}
+  .cupAnim.still{animation:none}
+  .wNum.ok{color:var(--ok);background:#e9f5ec;border-color:var(--ok)}
   .steps .bar i{position:absolute;inset:0;width:40%;background:var(--accent);border-radius:4px;animation:slide 1.4s ease-in-out infinite}
   @keyframes slide{from{left:-40%}to{left:100%}}
   .wBox{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:8px 14px 12px;text-align:left}
@@ -557,17 +560,47 @@ ${o.lines.map(l => `• ${l.qty} × ${l.name}`).join("\n")}
 ${o.note ? "\n📝 " + o.note + "\n" : ""}
 💰 ${fmt(o.total)} — ${o.pay}`;
 }
+const TG = m => `https://api.telegram.org/bot${CONFIG.telegramToken}/${m}`;
+const TG_BTNS = JSON.stringify({ inline_keyboard: [[
+  { text: "🍹 Đang pha", callback_data: "making" },
+  { text: "✅ Xong – đã thanh toán", callback_data: "done" },
+]]});
 async function sendTelegram(o){
-  const body = new URLSearchParams({ chat_id: CONFIG.telegramChatId, text: orderText(o) });
-  const api = m => `https://api.telegram.org/bot${CONFIG.telegramToken}/${m}`;
-  const r = await fetch(api("sendMessage"), { method: "POST", body });
+  const r = await fetch(TG("sendMessage"), { method: "POST",
+    body: new URLSearchParams({ chat_id: CONFIG.telegramChatId, text: orderText(o), reply_markup: TG_BTNS }) });
   if (!r.ok) throw new Error("telegram " + r.status);
   // Số đơn = số thứ tự tin nhắn Telegram (tăng dần, không trùng)
   try{
     const j = await r.json(); o.num = j.result.message_id;
-    fetch(api("editMessageText"), { method: "POST", body: new URLSearchParams({ chat_id: CONFIG.telegramChatId, message_id: o.num, text: orderText(o) }) }).catch(()=>{});
+    fetch(TG("editMessageText"), { method: "POST", body: new URLSearchParams({ chat_id: CONFIG.telegramChatId, message_id: o.num, text: orderText(o), reply_markup: TG_BTNS }) }).catch(()=>{});
   }catch{ o.num = 0; }
 }
+/* Theo dõi trạng thái: chủ quán bấm nút dưới tin nhắn Telegram → máy khách thấy và cập nhật */
+let pollTimer = null;
+async function pollStatus(){
+  const lo = store.get("lastOrder", null);
+  if (!LIVE || !lo || !lo.num || lo.status === "done") return stopPoll();
+  try{
+    const q = new URLSearchParams({ offset: "-100", allowed_updates: JSON.stringify(["callback_query"]) });
+    const r = await fetch(TG("getUpdates") + "?" + q); const j = await r.json();
+    let st = null, cbs = [];
+    for (const u of (j.result || [])){
+      const cb = u.callback_query;
+      if (cb && cb.message && cb.message.message_id === lo.num){ st = cb.data; cbs.push(cb.id); }
+    }
+    if (st && st !== lo.status){
+      lo.status = st; store.set("lastOrder", lo);
+      cbs.forEach(id => fetch(TG("answerCallbackQuery"), { method: "POST", body: new URLSearchParams({ callback_query_id: id, text: st === "done" ? `Đơn ${lo.num}: đã báo khách hoàn thành` : `Đơn ${lo.num}: đã báo khách đang pha` }) }).catch(()=>{}));
+      const mark = st === "done" ? "\n\n✅ ĐÃ HOÀN THÀNH" : "\n\n🍹 ĐANG PHA";
+      fetch(TG("editMessageText"), { method: "POST", body: new URLSearchParams({ chat_id: CONFIG.telegramChatId, message_id: lo.num, text: orderText(lo) + mark,
+        ...(st === "done" ? {} : { reply_markup: JSON.stringify({ inline_keyboard: [[{ text: "✅ Xong – đã thanh toán", callback_data: "done" }]] }) }) }) }).catch(()=>{});
+      if (document.getElementById("waiting").classList.contains("show")) showWaiting(lo);
+      renderBanner();
+    }
+  }catch{}
+}
+function startPoll(){ if (!pollTimer && LIVE){ pollStatus(); pollTimer = setInterval(pollStatus, 4000); } }
+function stopPoll(){ clearInterval(pollTimer); pollTimer = null; }
 function callOwner(o){
   if (!CONFIG.callUser) return;
   const say = (o.num ? `Đơn số ${o.num}. ` : "Có đơn mới. ") + o.lines.map(l => `${l.qty} ${l.name}`).join(", ") + ".";
@@ -591,22 +624,28 @@ async function copyTxt(t, el){ try{ await navigator.clipboard.writeText(t); el.t
 function showDone(o){
   Object.keys(cart).forEach(k => delete cart[k]); notes = new Set();
   renderMenu(); updateBar(); closeSheet();
-  store.set("lastOrder", { ...o, at: Date.now() });
+  o.status = "sent"; o.at = Date.now();
+  store.set("lastOrder", o);
   showWaiting(o);
 }
 function showWaiting(o){
+  const st = o.status || "sent", done = st === "done";
+  const head = done ? "Đơn đã hoàn thành 🎉" : st === "making" ? "Quán đang pha món cho bạn" : "Quán đã nhận đơn";
+  const sub = done ? "Cảm ơn bạn đã ghé Mi Tea!<br>Chúc bạn ngồi chill vui vẻ 🌊"
+    : st === "making" ? "Pha xong quán sẽ mang qua.<br>Bạn cứ ngồi ngắm sông nhé 🌊"
+    : "Quán sắp pha món cho bạn, pha xong quán sẽ mang qua.<br>Bạn cứ ngồi ngắm sông nhé 🌊";
   const w = document.getElementById("waiting");
   w.innerHTML = `
     <div class="wIn">
-      <div class="cupAnim">🧋<span class="steam">✨</span></div>
+      <div class="cupAnim ${done ? "still" : ""}">${done ? "🥳" : "🧋"}${done ? "" : '<span class="steam">✨</span>'}</div>
       <p class="wLabel">Số đơn của bạn</p>
-      <div class="wNum">${o.num ? o.num : "✓"}</div>
-      <h2>Quán đang pha món cho bạn</h2>
-      <p class="wSub">Pha xong quán mang qua và gọi <b>số ${o.num || "đơn"}</b>.<br>Bạn cứ ngồi ngắm sông nhé 🌊</p>
+      <div class="wNum ${done ? "ok" : ""}">${o.num ? o.num : "✓"}</div>
+      <h2>${head}</h2>
+      <p class="wSub">${sub}</p>
       <div class="steps">
-        <div class="st done">✓ Đã gửi đơn</div><div class="bar"><i></i></div>
-        <div class="st now">Đang pha</div><div class="bar"></div>
-        <div class="st">Mang qua</div>
+        <div class="st done">✓ Đã gửi đơn</div><div class="bar">${st === "sent" ? "<i></i>" : '<b class="full"></b>'}</div>
+        <div class="st ${st === "sent" ? "" : done ? "done" : "now"}">${st === "sent" ? "Đang pha" : done ? "✓ Đã pha" : "Đang pha"}</div><div class="bar">${st === "making" ? "<i></i>" : done ? '<b class="full"></b>' : ""}</div>
+        <div class="st ${done ? "done" : ""}">${done ? "✓ Hoàn thành" : "Hoàn thành"}</div>
       </div>
       <div class="wBox">
         ${o.lines.map(l => `<div class="row"><span>${l.qty} × ${esc(l.name)}</span><span>${fmt(l.qty*l.price)}</span></div>`).join("")}
@@ -614,15 +653,17 @@ function showWaiting(o){
         <div class="row total"><span>Tổng</span><span>${fmt(o.total)}</span></div>
         <p style="margin:2px 0 0;font-size:14px;color:var(--muted)">${o.pay === "Chuyển khoản" ? "🏦 Chuyển khoản" : "💵 Trả tiền mặt khi nhận"}</p>
       </div>
-      <button class="primary" onclick="hideWaiting()">Gọi thêm món</button>
+      <button class="primary" onclick="hideWaiting()">${done ? "Đặt đơn mới" : "Gọi thêm món"}</button>
     </div>`;
-  w.classList.add("show"); window.scrollTo(0,0);
+  w.classList.add("show");
+  if (!done) startPoll();
 }
 function hideWaiting(){ document.getElementById("waiting").classList.remove("show"); renderBanner(); }
 function renderBanner(){
   const lo = store.get("lastOrder", null), el = document.getElementById("lastBanner");
-  if (lo && lo.num && Date.now() - lo.at < 45*60*1000){
-    el.innerHTML = `🧋 Đơn số <b>${lo.num}</b> của bạn đang được pha · <u>Xem</u>`;
+  if (lo && lo.num && lo.status !== "done" && Date.now() - lo.at < 45*60*1000){
+    el.innerHTML = `🧋 Đơn số <b>${lo.num}</b> ${lo.status === "making" ? "đang được pha" : "đã gửi quán"} · <u>Xem</u>`;
+    startPoll();
     el.onclick = () => showWaiting(lo); el.classList.remove("hide");
   } else el.classList.add("hide");
 }
